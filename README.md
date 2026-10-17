@@ -77,8 +77,7 @@ CycleDiffusion is a deep learning architecture that implements a cycle-consisten
 ## Technical Requirements
 
 The system requires:
-- **Multi-GPU setup** (minimum 2 GPUs recommended)
-- **CUDA-compatible hardware** with sufficient VRAM
+- One GPU (CUDA, or Apple MPS for small-resolution smoke tests)
 - **PyTorch ecosystem** with diffusers, transformers, and accelerate libraries
 
 ## Getting Started
@@ -87,8 +86,11 @@ The system requires:
 # Set up environment
 export PYTHONPATH="/path/to/cyclediffusion:$PYTHONPATH"
 
-# Launch training
-python src/training/train_cyclediffusion.py
+# Check the differentiable Pix2Struct patcher matches the HF processor
+python tests/test_flatten_patches.py
+
+# Launch training (see --help for lambda, K grad steps, guidance, captioner)
+python src/training/train_cyclediffusion.py --out runs/cyclediff
 
 # Monitor with TensorBoard
 tensorboard --logdir=./runs/
