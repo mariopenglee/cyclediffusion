@@ -1,8 +1,10 @@
 import argparse
+import copy
 import os
 
 import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
@@ -22,6 +24,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--accumulation-steps", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lora-rank", type=int, default=0, help="train LoRA adapters on the UNet attention projections; 0 = full UNet")
     p.add_argument("--max-steps", type=int, default=2000, help="optimizer steps")
     p.add_argument("--denoise-weight", type=float, default=1.0, help="lambda on the denoising regularizer; 0 = pure cycle loss")
     p.add_argument("--sample-steps", type=int, default=20)
@@ -43,8 +46,12 @@ def main():
     model.diffuser.to(device)
     model.captioner.to(device)
     model.diffuser.unet.enable_gradient_checkpointing()
+    if args.lora_rank:
+        model.diffuser.unet = get_peft_model(model.diffuser.unet, LoraConfig(
+            r=args.lora_rank, lora_alpha=args.lora_rank, target_modules=["to_q", "to_k", "to_v", "to_out.0"]))
     model.diffuser.unet.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
 
     tf = transforms.Compose([
         transforms.Resize(args.size), transforms.CenterCrop(args.size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5]),
@@ -68,7 +75,7 @@ def main():
         if micro % args.accumulation_steps:
             continue
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
         optimizer.step()
         optimizer.zero_grad()
         step += 1
@@ -76,7 +83,9 @@ def main():
         writer.add_scalar("loss/denoise", denoise_loss.item(), step)
         print(f"step {step} cycle {cycle_loss.item():.4f} denoise {denoise_loss.item():.4f}", flush=True)
         if step % args.save_every == 0 or step == args.max_steps:
-            model.diffuser.unet.save_pretrained(os.path.join(args.out, f"unet-{step}"))
+            unet = model.diffuser.unet
+            # LoRA checkpoints are saved merged so evaluate.py loads them like a full UNet
+            (copy.deepcopy(unet).merge_and_unload() if args.lora_rank else unet).save_pretrained(os.path.join(args.out, f"unet-{step}"))
             save_image(generated.detach().float(), os.path.join(args.out, f"samples-{step}.png"))
         if step == args.max_steps:
             break
