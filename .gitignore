@@ -55,3 +55,6 @@ Archive.zip
 *.png
 
 .DS_Store
+
+.venv/
+runs/

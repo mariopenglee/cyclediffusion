@@ -1,0 +1,3 @@
+# evals for BLIP lambda=0.1, usage: bash blip_lam01_evals.sh GPU STEP...
+export CUDA_VISIBLE_DEVICES=$1 PYTHONPATH=.; shift
+for s in "$@"; do .venv/bin/python -u src/eval/evaluate.py --unet runs/lora-blip-lam0.1/unet-$s --out runs/eval/lora-blip-lam0.1-$s > runs/eval-lora-blip-lam0.1-$s.log 2>&1; done

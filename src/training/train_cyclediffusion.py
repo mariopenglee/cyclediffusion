@@ -1,136 +1,103 @@
-import torch.optim as optim
-import torch.nn as nn
-import torch
-import tqdm 
-from models.cyclediffusion import CycleDiffusionModel
-from src.data_preparation.captions_dataset import ds_train, ds_test
-from torch.utils.data import DataLoader
-from src.training.training_utils import cycle_collator
-from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
+import argparse
+import copy
 import os
-import sys
+import random
 
-def log_gradients(model, writer, step):
-    # Log gradients for Captioner
-    for name, param in model.captioner.model.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            writer.add_histogram(f"Captioner/gradients/{name}", param.grad, step)
-    
-    # Log gradients for Diffuser's UNet
-    for name, param in model.diffuser.unet.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            writer.add_histogram(f"Diffuser/gradients/unet/{name}", param.grad, step)
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+from torchvision.utils import save_image
 
-    # Log gradients for Diffuser's text_encoder
-    for name, param in model.diffuser.text_encoder.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            writer.add_histogram(f"Diffuser/gradients/text_encoder/{name}", param.grad, step)
-
-    # Log gradients for Diffuser's vae
-    for name, param in model.diffuser.vae.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            writer.add_histogram(f"Diffuser/gradients/vae/{name}", param.grad, step)
+from models.cyclediffusion import CycleDiffusionModel
 
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--diffuser", default="OFA-Sys/small-stable-diffusion-v0")
+    p.add_argument("--captioner", default="google/pix2struct-textcaps-base")
+    p.add_argument("--dataset", default="jxie/coco_captions")
+    p.add_argument("--image-col", default="image")
+    p.add_argument("--text-col", default="caption")
+    p.add_argument("--prompts", default=None, help="text file, one prompt per line: cycle-loss prompts are drawn from it "
+                                                   "instead of the dataset captions (which still drive the denoising loss)")
+    p.add_argument("--size", type=int, default=512)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--accumulation-steps", type=int, default=4)
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lora-rank", type=int, default=0, help="train LoRA adapters on the UNet attention projections; 0 = full UNet")
+    p.add_argument("--max-steps", type=int, default=2000, help="optimizer steps")
+    p.add_argument("--denoise-weight", type=float, default=1.0, help="lambda on the denoising regularizer; 0 = pure cycle loss")
+    p.add_argument("--sample-steps", type=int, default=20)
+    p.add_argument("--grad-steps", type=int, default=1, help="K: number of final denoising steps to backprop through")
+    p.add_argument("--guidance", type=float, default=7.5)
+    p.add_argument("--out", default="runs/cyclediff")
+    p.add_argument("--save-every", type=int, default=500)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
 
-# Save checkpoint
-def save_checkpoint(model, epoch, optimizer, file_path):
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict()
-    }, file_path)
 
-def train_cyclediff(model, optimizer, train_dataloader, val_dataloader, epochs=5, patience=3, accumulation_steps = 1):
-    scaler = GradScaler()
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    writer = SummaryWriter('runs/cyclediff')
-    best_loss = float('inf')  # Initialize best loss to a very high value
-    patience_counter = 0  # Initialize patience counter
-    CHECKPOINT_PATH = "checkpoints"
-    os.makedirs(CHECKPOINT_PATH, exist_ok=True)
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
+    model = CycleDiffusionModel(args.diffuser, args.captioner)
+    model.diffuser.to(device)
+    model.captioner.to(device)
+    model.diffuser.unet.enable_gradient_checkpointing()
+    if args.lora_rank:
+        model.diffuser.unet = get_peft_model(model.diffuser.unet, LoraConfig(
+            r=args.lora_rank, lora_alpha=args.lora_rank, target_modules=["to_q", "to_k", "to_v", "to_out.0"]))
+    model.diffuser.unet.train()
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
+
+    tf = transforms.Compose([
+        transforms.Resize(args.size), transforms.CenterCrop(args.size), transforms.ToTensor(), transforms.Normalize([0.5], [0.5]),
+    ])
+    ds = load_dataset(args.dataset, split="train", streaming=True).shuffle(seed=args.seed, buffer_size=10_000)
+    collate = lambda b: ([x[args.text_col] for x in b], torch.stack([tf(x[args.image_col].convert("RGB")) for x in b]))
+    loader = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate)
+
+    prompts = open(args.prompts).read().splitlines() if args.prompts else None
+    rng = random.Random(args.seed)
+
+    writer = SummaryWriter(args.out)
+    os.makedirs(args.out, exist_ok=True)
+    step, micro = 0, 0
+    for captions, images in loader:
+        prompts_batch = rng.choices(prompts, k=len(captions)) if prompts else captions
+        with torch.autocast(device, dtype=dtype, enabled=device == "cuda"):
+            cycle_loss, denoise_loss, generated = model(
+                prompts_batch, images.to(device) if args.denoise_weight > 0 else None, captions,
+                size=args.size, steps=args.sample_steps, grad_steps=args.grad_steps, guidance=args.guidance,
+            )
+            loss = cycle_loss + args.denoise_weight * denoise_loss
+        (loss / args.accumulation_steps).backward()
+        micro += 1
+        if micro % args.accumulation_steps:
+            continue
+
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        optimizer.step()
         optimizer.zero_grad()
-        train_progress = tqdm.tqdm(enumerate(train_dataloader), total=len(train_dataloader))
-        for batch_idx, batch in train_progress:
-            # get the structure of the batch
-            captions = batch["text"]
-            images = batch["image"]
-
-            
-            # writer.add_graph(model, input_to_model=text_embeddings)
-            with autocast():
-                outputs, pixel_loss = model(captions=captions, images=images)
-                print(f"output and pixel loss: {outputs.loss}, {pixel_loss}")
-                loss = outputs.loss + pixel_loss
-           
-            print(f"Loss: {loss.item()}")
-            # Backward pass
-            scaler.scale(loss).backward()
-            # log gradients
-            
-            
-            # Gradient accumulation
-            if (batch_idx + 1) % accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-            total_loss += loss.item()
-
-            # log loss
-            writer.add_scalar('Loss/train', loss.item(), epoch * len(train_dataloader) + batch_idx)
-            log_gradients(model, writer, epoch * len(train_dataloader) + batch_idx)
-            if batch_idx % 100 == 99:  # Print every 100 mini-batches
-                print('[%d, %5d] loss: %.3f' %
-                    (epoch + 1, batch_idx + 1, total_loss / 100))
-                total_loss = 0.0
-            
-
-        # Validation loss. Only at specific epochs
-        if epoch % 5 == 4:
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for batch in val_dataloader:
-                    data = batch
-                    captions = data["text"]
-                    with autocast():
-                        outputs = model(captions)
-                        loss = outputs.loss
-
-                    val_loss += loss.item()
-                    writer.add_scalar('Loss/val', loss.item(), epoch * len(val_dataloader) + batch_idx)
-            print(f"Validation loss: {val_loss / len(val_dataloader)}")
-            if val_loss < best_loss:
-                best_loss = val_loss
-                patience_counter = 0
-                save_checkpoint(model, epoch, optimizer, os.path.join(CHECKPOINT_PATH, "best_model.pt"))
-            else:
-                patience_counter += 1
-            if patience_counter >= patience:
-                print("Early stopping")
-                break
-
-
-    print('Finished Training')
+        step += 1
+        writer.add_scalar("loss/cycle", cycle_loss.item(), step)
+        writer.add_scalar("loss/denoise", denoise_loss.item(), step)
+        print(f"step {step} cycle {cycle_loss.item():.4f} denoise {denoise_loss.item():.4f}", flush=True)
+        if step % args.save_every == 0 or step == args.max_steps:
+            unet = model.diffuser.unet
+            # LoRA checkpoints are saved merged so evaluate.py loads them like a full UNet
+            (copy.deepcopy(unet).merge_and_unload() if args.lora_rank else unet).save_pretrained(os.path.join(args.out, f"unet-{step}"))
+            save_image(generated.detach().float(), os.path.join(args.out, f"samples-{step}.png"))
+        if step == args.max_steps:
+            break
     writer.close()
 
 
-
-
-
-
 if __name__ == "__main__":
-    # Example usage
-    model = CycleDiffusionModel(verbose=False).split_models(debug=True)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    train_dataloader = DataLoader(ds_train, batch_size=1, shuffle=True, collate_fn=cycle_collator)
-    val_dataloader = DataLoader(ds_test, batch_size=1, shuffle=True, collate_fn=cycle_collator)
-
-    train_cyclediff(model, optimizer, train_dataloader, val_dataloader, epochs=1000, patience=3, accumulation_steps = 4)
-
+    main()
