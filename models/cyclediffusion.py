@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from transformers import AutoProcessor, CLIPTextModel, CLIPTokenizer, Pix2StructForConditionalGeneration
+from transformers import (AutoProcessor, BlipForConditionalGeneration, BlipProcessor, CLIPTextModel, CLIPTokenizer,
+                          Pix2StructForConditionalGeneration)
 
 
 class Captioner(nn.Module):
@@ -65,6 +66,32 @@ class Captioner(nn.Module):
         return nll.sum(1) / (labels != -100).sum(1)
 
 
+class BlipCaptioner(nn.Module):
+    """
+    Frozen BLIP captioner as a differentiable critic, same interface as Captioner: per-caption mean token NLL.
+    """
+    def __init__(self, model_id="Salesforce/blip-image-captioning-large", max_length=48):
+        super().__init__()
+        self.model = BlipForConditionalGeneration.from_pretrained(model_id).requires_grad_(False).eval()
+        processor = BlipProcessor.from_pretrained(model_id)
+        self.tokenizer, self.max_length = processor.tokenizer, max_length
+        self.size = processor.image_processor.size["height"]
+        self.register_buffer("mean", torch.tensor(processor.image_processor.image_mean).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("std", torch.tensor(processor.image_processor.image_std).view(1, 3, 1, 1), persistent=False)
+
+    def forward(self, images, captions):
+        pixels = F.interpolate(images, size=(self.size, self.size), mode="bicubic", align_corners=False, antialias=True)
+        pixels = (pixels - self.mean) / self.std
+        tok = self.tokenizer(captions, padding=True, truncation=True, max_length=self.max_length,
+                             return_tensors="pt").to(images.device)
+        input_ids = tok.input_ids.clone()
+        input_ids[:, 0] = self.model.config.text_config.bos_token_id  # BLIP decodes from [DEC], not [CLS]
+        logits = self.model(pixel_values=pixels, input_ids=input_ids, attention_mask=tok.attention_mask).logits
+        labels = input_ids[:, 1:].masked_fill(tok.attention_mask[:, 1:] == 0, -100)
+        nll = F.cross_entropy(logits[:, :-1].float().transpose(1, 2), labels, ignore_index=-100, reduction="none")
+        return nll.sum(1) / (labels != -100).sum(1)
+
+
 class Diffuser(nn.Module):
     """
     Stable Diffusion with a trainable UNet; text encoder and VAE are frozen.
@@ -122,12 +149,14 @@ class CycleDiffusionModel(nn.Module):
     def __init__(self, diffuser_id="OFA-Sys/small-stable-diffusion-v0", captioner_id="google/pix2struct-textcaps-base"):
         super().__init__()
         self.diffuser = Diffuser(diffuser_id)
-        self.captioner = Captioner(captioner_id)
+        self.captioner = (BlipCaptioner if "blip" in captioner_id.lower() else Captioner)(captioner_id)
 
-    def forward(self, captions, images=None, **sample_kwargs):
+    def forward(self, captions, images=None, image_captions=None, **sample_kwargs):
+        """image_captions: captions of `images` for the denoising loss, when they differ from the cycle prompts"""
         generated = self.diffuser.sample(captions, **sample_kwargs)
         cycle_loss = self.captioner(generated, captions).mean()
-        denoise_loss = self.diffuser.denoise_loss(captions, images) if images is not None else cycle_loss.new_zeros(())
+        denoise_loss = (self.diffuser.denoise_loss(image_captions or captions, images) if images is not None
+                        else cycle_loss.new_zeros(()))
         return cycle_loss, denoise_loss, generated
 
     def parameters(self, recurse: bool = True):

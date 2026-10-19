@@ -1,6 +1,7 @@
 import argparse
 import copy
 import os
+import random
 
 import torch
 from datasets import load_dataset
@@ -20,6 +21,8 @@ def parse_args():
     p.add_argument("--dataset", default="jxie/coco_captions")
     p.add_argument("--image-col", default="image")
     p.add_argument("--text-col", default="caption")
+    p.add_argument("--prompts", default=None, help="text file, one prompt per line: cycle-loss prompts are drawn from it "
+                                                   "instead of the dataset captions (which still drive the denoising loss)")
     p.add_argument("--size", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--accumulation-steps", type=int, default=4)
@@ -60,13 +63,17 @@ def main():
     collate = lambda b: ([x[args.text_col] for x in b], torch.stack([tf(x[args.image_col].convert("RGB")) for x in b]))
     loader = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate)
 
+    prompts = open(args.prompts).read().splitlines() if args.prompts else None
+    rng = random.Random(args.seed)
+
     writer = SummaryWriter(args.out)
     os.makedirs(args.out, exist_ok=True)
     step, micro = 0, 0
     for captions, images in loader:
+        prompts_batch = rng.choices(prompts, k=len(captions)) if prompts else captions
         with torch.autocast(device, dtype=dtype, enabled=device == "cuda"):
             cycle_loss, denoise_loss, generated = model(
-                captions, images.to(device) if args.denoise_weight > 0 else None,
+                prompts_batch, images.to(device) if args.denoise_weight > 0 else None, captions,
                 size=args.size, steps=args.sample_steps, grad_steps=args.grad_steps, guidance=args.guidance,
             )
             loss = cycle_loss + args.denoise_weight * denoise_loss
