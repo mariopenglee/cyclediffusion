@@ -36,6 +36,7 @@ def parse_args():
     p.add_argument("--out", default="runs/cyclediff")
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--word-only", action="store_true", help="cycle loss only on the tokens of each prompt's 'quoted' word")
     return p.parse_args()
 
 
@@ -45,7 +46,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    model = CycleDiffusionModel(args.diffuser, args.captioner)
+    model = CycleDiffusionModel(args.diffuser, args.captioner, args.word_only)
     model.diffuser.to(device)
     model.captioner.to(device)
     model.diffuser.unet.enable_gradient_checkpointing()

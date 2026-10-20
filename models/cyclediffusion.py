@@ -1,4 +1,5 @@
 import math
+import re
 
 import torch
 import torch.nn as nn
@@ -6,6 +7,14 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from transformers import (AutoProcessor, BlipForConditionalGeneration, BlipProcessor, CLIPTextModel, CLIPTokenizer,
                           Pix2StructForConditionalGeneration)
+
+QUOTED = re.compile(r"'([^']+)'")
+
+
+def quoted_word_mask(offsets, captions):
+    """(B, L) bool: tokens whose character span overlaps the caption's 'quoted' word. offsets: (B, L, 2)"""
+    spans = torch.tensor([QUOTED.search(c).span(1) for c in captions], device=offsets.device)
+    return (offsets[..., 0] < spans[:, 1:]) & (offsets[..., 1] > spans[:, :1])
 
 
 class Captioner(nn.Module):
@@ -56,10 +65,14 @@ class Captioner(nn.Module):
         attention_mask[:, : rows * cols] = 1
         return flattened, attention_mask
 
-    def forward(self, images, captions):
-        labels = self.tokenizer(captions, padding="max_length", truncation=True, max_length=self.max_length,
-                                return_tensors="pt").input_ids.to(images.device)
+    def forward(self, images, captions, word_only=False):
+        """word_only: score only the tokens of the caption's 'quoted' word (still conditioned on the full prefix)"""
+        tok = self.tokenizer(captions, padding="max_length", truncation=True, max_length=self.max_length,
+                             return_tensors="pt", return_offsets_mapping=word_only).to(images.device)
+        labels = tok.input_ids
         labels[labels == self.tokenizer.pad_token_id] = -100
+        if word_only:
+            labels[~quoted_word_mask(tok.offset_mapping, captions)] = -100
         flattened, attention_mask = self.flatten_patches(images)
         logits = self.model(flattened_patches=flattened, attention_mask=attention_mask, labels=labels).logits
         nll = F.cross_entropy(logits.float().transpose(1, 2), labels, ignore_index=-100, reduction="none")
@@ -79,15 +92,17 @@ class BlipCaptioner(nn.Module):
         self.register_buffer("mean", torch.tensor(processor.image_processor.image_mean).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor(processor.image_processor.image_std).view(1, 3, 1, 1), persistent=False)
 
-    def forward(self, images, captions):
+    def forward(self, images, captions, word_only=False):
         pixels = F.interpolate(images, size=(self.size, self.size), mode="bicubic", align_corners=False, antialias=True)
         pixels = (pixels - self.mean) / self.std
         tok = self.tokenizer(captions, padding=True, truncation=True, max_length=self.max_length,
-                             return_tensors="pt").to(images.device)
+                             return_tensors="pt", return_offsets_mapping=word_only).to(images.device)
         input_ids = tok.input_ids.clone()
         input_ids[:, 0] = self.model.config.text_config.bos_token_id  # BLIP decodes from [DEC], not [CLS]
         logits = self.model(pixel_values=pixels, input_ids=input_ids, attention_mask=tok.attention_mask).logits
         labels = input_ids[:, 1:].masked_fill(tok.attention_mask[:, 1:] == 0, -100)
+        if word_only:
+            labels = labels.masked_fill(~quoted_word_mask(tok.offset_mapping[:, 1:], captions), -100)
         nll = F.cross_entropy(logits[:, :-1].float().transpose(1, 2), labels, ignore_index=-100, reduction="none")
         return nll.sum(1) / (labels != -100).sum(1)
 
@@ -146,15 +161,17 @@ class CycleDiffusionModel(nn.Module):
     how likely the original caption is given that image, and that NLL is backpropagated into the UNet.
     The standard denoising loss on real pairs acts as a regularizer against reward hacking.
     """
-    def __init__(self, diffuser_id="OFA-Sys/small-stable-diffusion-v0", captioner_id="google/pix2struct-textcaps-base"):
+    def __init__(self, diffuser_id="OFA-Sys/small-stable-diffusion-v0", captioner_id="google/pix2struct-textcaps-base",
+                 word_only=False):
         super().__init__()
         self.diffuser = Diffuser(diffuser_id)
         self.captioner = (BlipCaptioner if "blip" in captioner_id.lower() else Captioner)(captioner_id)
+        self.word_only = word_only
 
     def forward(self, captions, images=None, image_captions=None, **sample_kwargs):
         """image_captions: captions of `images` for the denoising loss, when they differ from the cycle prompts"""
         generated = self.diffuser.sample(captions, **sample_kwargs)
-        cycle_loss = self.captioner(generated, captions).mean()
+        cycle_loss = self.captioner(generated, captions, word_only=self.word_only).mean()
         denoise_loss = (self.diffuser.denoise_loss(image_captions or captions, images) if images is not None
                         else cycle_loss.new_zeros(()))
         return cycle_loss, denoise_loss, generated
